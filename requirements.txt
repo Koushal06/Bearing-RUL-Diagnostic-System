@@ -9,4 +9,5 @@ catboost
 shap
 joblib
 google-generativeai
-ploty
+plotly
+ollama
