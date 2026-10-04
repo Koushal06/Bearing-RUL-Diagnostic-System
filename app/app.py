@@ -1683,7 +1683,6 @@ elif page == "Model Performance":
         apply_plotly_readability(fig_r2)
     st.plotly_chart(fig_r2, width="stretch")
 
-
 # ============================================================
 # PAGE: MAINTENANCE RECOMMENDATIONS
 # ============================================================
@@ -1716,7 +1715,6 @@ elif page == "Maintenance Recommendations":
         apply_plotly_readability(fig_pie)
     st.plotly_chart(fig_pie, width="stretch")
 
-
 # ============================================================
 # PAGE: PREDICTION CONFIDENCE
 # ============================================================
@@ -1730,7 +1728,6 @@ elif page == "Prediction Confidence":
     c2.metric("Empirical Coverage (PICP)", f"{unc.get('PICP', 0.889)*100:.1f}%")
     c3.metric("Mean Interval Width (MPIW)", f"{unc.get('MPIW', 80.74):.2f}%")
     st.info("The CQR interval has a nominal 90% coverage target. In the reported evaluation, empirical PICP was 88.9%, close to the target, with interval width reported separately.")
-
 
 # ============================================================
 # PAGE: WHY THIS PREDICTION? (SHAP)
@@ -1747,8 +1744,6 @@ elif page == "Why This Prediction?":
     fig_imp.update_layout(paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)", font={"color": COLOR["text"]})
     apply_plotly_readability(fig_imp)
     st.plotly_chart(fig_imp, width="stretch")
-
-
 # ============================================================
 # PAGE: AI MAINTENANCE ASSISTANT
 # ============================================================
@@ -1773,6 +1768,5 @@ elif page == "AI Maintenance Assistant":
 
         if "fleet_ai_text" in st.session_state:
             st.markdown(f'<div class="panel">{st.session_state["fleet_ai_text"]}</div>', unsafe_allow_html=True)
-
 
 # FINAL PRESENTATION BUILD: synthetic low-risk generator removed; live risk is data-driven.
