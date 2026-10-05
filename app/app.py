@@ -14,11 +14,11 @@ PIPELINE:
   -> CatBoost Point Prediction
   -> XGBoost Quantile Models + CQR (90% interval)
   -> SHAP Explainability
-  -> 4-Tier Risk-Aware Maintenance Policy:
+  -> 3-Tier Risk Classification + Severity-Aware Maintenance Policy:
       - Low: Continue monitoring
       - Medium: Inspect before replacement
       - High: Schedule maintenance
-      - Critical: Replace immediately
+      - Severe High: Replace immediately
 """
 
 # pyright: reportMissingImports=false
@@ -680,6 +680,20 @@ div[data-baseweb="select"] > div {
     background: var(--input-bg) !important;
     border: 1px solid var(--border) !important;
     border-radius: 12px !important;
+}
+
+/* Keep selectbox text readable in both themes. */
+div[data-baseweb="select"] * {
+    color: var(--text) !important;
+}
+div[data-baseweb="select"] input {
+    color: var(--text) !important;
+    -webkit-text-fill-color: var(--text) !important;
+}
+ul[role="listbox"],
+ul[role="listbox"] * {
+    color: var(--text) !important;
+    background: var(--surface) !important;
 }
 
 hr {
@@ -2115,7 +2129,8 @@ if page == "Upload Bearing Data":
             if _saved_name != _new_upload_name or _saved_bytes != _new_upload_bytes:
                 st.session_state["bearing_upload_name"] = _new_upload_name
                 st.session_state["bearing_upload_bytes"] = _new_upload_bytes
-                # Clear upload-specific generated text when the bearing changes.
+                # Clear upload-specific results when a genuinely new bearing is selected.
+                st.session_state.pop("bearing_upload_result", None)
                 st.session_state.pop("upload_ai_text", None)
                 st.session_state.pop("upload_ai_file", None)
         except Exception as exc:
@@ -2342,6 +2357,17 @@ if page == "Upload Bearing Data":
     risk_level, risk_color, risk_css = uncertainty_risk_level(pt, lo)
     act = maintenance_action(pt, lo)
     act_col = action_color(act)
+
+    # Persist the latest diagnostic summary so other pages can show the same
+    # uploaded bearing without requiring another upload or recomputation.
+    st.session_state["bearing_upload_result"] = {
+        "filename": file_label,
+        "predicted_rul": pt,
+        "lower_bound": lo,
+        "upper_bound": hi,
+        "risk": risk_level,
+        "action": act,
+    }
 
     # ------------------------------------------------------------------
     # STEP 6: AUTOMATIC RISK CLASSIFICATION
@@ -2680,9 +2706,37 @@ elif page == "Dashboard":
         with k3: st.metric("Fleet Average RUL", f"{avg_rul:.1f}%" if not np.isnan(avg_rul) else "—")
         with k4: st.metric("Lowest Asset Life", f"{lowest_rul:.1f}%" if not np.isnan(lowest_rul) else "—")
 
+    # --------------------------------------------------------------
+    # ACTIVE UPLOADED BEARING
+    # Show the current session upload on the dashboard so faculty can see
+    # which file is being diagnosed while navigating between pages.
+    # --------------------------------------------------------------
+    active_upload = st.session_state.get("bearing_upload_result")
+    if active_upload:
+        st.markdown("### Active Data Source — Uploaded Bearing")
+        st.markdown(
+            f"""
+            <div class="panel panel-accent" style="margin-bottom:1rem;">
+                <div class="eyebrow">CURRENT UPLOADED FILE // SESSION DIAGNOSIS</div>
+                <div style="font-size:1.05rem; line-height:1.8;">
+                    <b>File:</b> {active_upload['filename']}<br>
+                    <b>Predicted RUL:</b> {active_upload['predicted_rul']:.1f}% &nbsp; | &nbsp;
+                    <b>90% Range:</b> {active_upload['lower_bound']:.1f}% – {active_upload['upper_bound']:.1f}% &nbsp; | &nbsp;
+                    <b>Risk:</b> {active_upload['risk'].upper()}<br>
+                    <b>Recommended Action:</b> {active_upload['action']}
+                </div>
+                <div class="kpi-help" style="margin-top:0.45rem;">
+                    This is the bearing uploaded during the current Streamlit session.
+                    The saved upload remains available while navigating between pages.
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
     st.markdown("---")
     st.markdown("### Low Remaining Life Priority Queue")
-    st.caption("Bearings with predicted RUL below 40%, sorted by urgency:")
+    st.caption("Project evaluation predictions with RUL below 40%, sorted by urgency. The active uploaded file is identified above.")
 
     if has_pred:
         action_col = get_action_col(pred_df)
@@ -2707,187 +2761,394 @@ elif page == "Dashboard":
 # ============================================================
 # PAGE: BEARING HEALTH
 # ============================================================
+elif page == "Model Performance":
+    st.markdown('<div class="eyebrow">ANALYTICS // MODEL EVALUATION</div>', unsafe_allow_html=True)
+    st.markdown("## Model Performance")
+    st.markdown(
+        '<div class="hero-subtitle">Comparison of candidate RUL regression models using the project evaluation metrics.</div>',
+        unsafe_allow_html=True,
+    )
+
+    model_df, model_live = load_model_comparison()
+    unc_metrics, unc_live = load_uncertainty_metrics()
+
+    if model_df is None or model_df.empty:
+        st.warning("Model comparison results are not available.")
+    else:
+        perf = model_df.copy()
+        rename_map = {}
+        for c in perf.columns:
+            cl = str(c).strip().lower()
+            if cl in {"model", "model_name", "algorithm"}:
+                rename_map[c] = "model"
+            elif cl in {"mae", "mean_absolute_error"}:
+                rename_map[c] = "MAE"
+            elif cl in {"rmse", "root_mean_squared_error"}:
+                rename_map[c] = "RMSE"
+            elif cl in {"r2", "r²", "r_2", "r-squared", "r_squared"}:
+                rename_map[c] = "R2"
+        perf = perf.rename(columns=rename_map)
+
+        required = {"model", "MAE", "RMSE", "R2"}
+        if not required.issubset(perf.columns):
+            st.error(
+                "The model comparison file does not contain the expected "
+                "model, MAE, RMSE and R² columns."
+            )
+        else:
+            for c in ["MAE", "RMSE", "R2"]:
+                perf[c] = pd.to_numeric(perf[c], errors="coerce")
+            perf = perf.dropna(subset=["model", "MAE", "RMSE", "R2"]).copy()
+
+            best_row = perf.loc[perf["MAE"].idxmin()]
+            best_model = str(best_row["model"])
+            best_mae = float(best_row["MAE"])
+            best_rmse = float(best_row["RMSE"])
+            best_r2 = float(best_row["R2"])
+
+            c1, c2, c3, c4 = st.columns(4)
+            with c1:
+                st.metric("Selected Model", best_model)
+            with c2:
+                st.metric("Best MAE", f"{best_mae:.2f}")
+            with c3:
+                st.metric("Best RMSE", f"{best_rmse:.2f}")
+            with c4:
+                st.metric("Best R²", f"{best_r2:.3f}")
+
+            st.markdown("### Candidate Model Comparison")
+            display_df = perf[["model", "MAE", "RMSE", "R2"]].copy()
+            display_df.columns = ["Model", "MAE", "RMSE", "R²"]
+            st.dataframe(
+                display_df.style.format({
+                    "MAE": "{:.2f}",
+                    "RMSE": "{:.2f}",
+                    "R²": "{:.3f}",
+                }),
+                use_container_width=True,
+                hide_index=True,
+            )
+
+            fig = go.Figure()
+            fig.add_trace(go.Bar(
+                x=perf["model"],
+                y=perf["MAE"],
+                name="MAE",
+                text=[f"{v:.2f}" for v in perf["MAE"]],
+                textposition="outside",
+            ))
+            fig.update_layout(
+                title="MAE Comparison — Lower is Better",
+                xaxis_title="Model",
+                yaxis_title="MAE",
+                height=430,
+                margin=dict(l=20, r=20, t=65, b=20),
+                paper_bgcolor="white",
+                plot_bgcolor="white",
+                font=dict(color="#16283A"),
+                xaxis=dict(
+                    tickfont=dict(color="#16283A"),
+                    title_font=dict(color="#16283A"),
+                ),
+                yaxis=dict(
+                    tickfont=dict(color="#16283A"),
+                    title_font=dict(color="#16283A"),
+                    gridcolor="#E5EAF0",
+                ),
+            )
+            st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
+
+            st.markdown(
+                f"""
+                <div class="panel panel-accent" style="margin-top:0.5rem;">
+                    <div class="eyebrow">MODEL SELECTION</div>
+                    <div style="font-size:1rem;line-height:1.7;color:var(--text);">
+                        <b>{best_model}</b> is the selected point-RUL model because it achieved
+                        the lowest MAE ({best_mae:.2f}) in this project comparison.
+                        The model is used as the point-prediction component of the diagnostic pipeline.
+                    </div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
+            st.markdown("### Uncertainty Evaluation")
+            u1, u2, u3, u4 = st.columns(4)
+            target_cov = float(unc_metrics.get("target_coverage", 0.90))
+            picp = float(unc_metrics.get("PICP", np.nan))
+            mpiw = float(unc_metrics.get("MPIW", np.nan))
+            cwc = float(unc_metrics.get("CWC", np.nan))
+            with u1:
+                st.metric("Target Coverage", f"{target_cov * 100:.1f}%")
+            with u2:
+                st.metric("Observed PICP", f"{picp * 100:.1f}%")
+            with u3:
+                st.metric("MPIW", f"{mpiw:.2f}")
+            with u4:
+                st.metric("CWC", f"{cwc:.3f}")
+
+            st.info(
+                "The uncertainty metrics describe the calibrated prediction interval and "
+                "are evaluated separately from the four-model point-prediction comparison above."
+            )
+
+            st.caption(
+                "Source: project model-comparison and uncertainty-evaluation artifacts."
+                + (" Live artifact data." if model_live or unc_live else " Stored evaluation values.")
+            )
+
 elif page == "Bearing Health":
     st.markdown('<div class="eyebrow">MODULE // BEARING HEALTH ASSESSMENT</div>', unsafe_allow_html=True)
     st.markdown("## Individual Bearing Health & RUL")
 
     pred_df, pred_live = load_predictions()
-    if pred_df is None or pred_df.empty:
-        st.warning("No prediction data available.")
-        st.stop()
+    _active = st.session_state.get("bearing_upload_result")
 
-    b_col1, b_col2 = st.columns([1, 2])
-    with b_col1:
-        bearing = st.selectbox("Select Bearing Unit:", sorted(pred_df["bearing"].unique()))
-    bearing_df = pred_df[pred_df["bearing"] == bearing].reset_index(drop=True)
-
-    with b_col2:
-        idx_col = "snapshot_idx" if "snapshot_idx" in bearing_df.columns else bearing_df.index
-        snapshot = st.select_slider("Select Inspection Snapshot:", options=sorted(bearing_df[idx_col].unique()))
-
-    row = bearing_df[bearing_df[idx_col] == snapshot].iloc[0]
-    rul = float(row["predicted_RUL_pct"])
-    lower = float(row["lower_bound_pct"])
-    upper = float(row["upper_bound_pct"])
-    action = row.get(get_action_col(bearing_df), "Continue monitoring")
-    act_col = action_color(action)
-    risk, color, _ = uncertainty_risk_level(rul, lower)
-
-    st.markdown(
-        f"""
-        <div class="result-hero" style="border-top:4px solid {color};">
-            <div class="result-hero-label">Bearing Health Status</div>
-            <div class="result-hero-status" style="color:{color};">{risk.upper()} RISK</div>
-            <div class="result-hero-label" style="margin-top:10px;">Predicted Remaining Useful Life</div>
-            <div class="result-hero-value" style="color:{color};">{rul:.1f}%</div>
-        </div>
-        """, unsafe_allow_html=True
-    )
-
-    r1, r2 = st.columns(2)
-    with r1:
-        st.markdown(
-            f"""
-            <div class="panel">
-                <div class="eyebrow">90% Prediction Range (CQR)</div>
-                <div style="font-family:'Poppins'; font-size:1.4rem; font-weight:600;">{lower:.1f}% — {upper:.1f}%</div>
-                <div class="kpi-help">The calibrated 90% confidence range based on vibration features.</div>
-            </div>
-            """, unsafe_allow_html=True
+    # Primary presentation path: keep the application focused on the bearing
+    # uploaded in the current Streamlit session.
+    if _active:
+        _active_name = _active.get(
+            "filename",
+            st.session_state.get("bearing_upload_name", "Uploaded bearing"),
         )
-    with r2:
+        rul = float(_active.get("predicted_rul", 0.0))
+        lower = float(_active.get("lower_bound", 0.0))
+        upper = float(_active.get("upper_bound", 0.0))
+        action = _active.get("action", maintenance_action(rul, lower))
+        act_col = action_color(action)
+        risk, color, _ = uncertainty_risk_level(rul, lower)
+
         st.markdown(
             f"""
-            <div class="action-card" style="--zone-color:{act_col};">
-                <div class="eyebrow">Prescribed Action</div>
-                <div style="font-family:'Poppins'; font-size:1.3rem; color:{act_col}; font-weight:700;">
+            <div class="panel panel-accent" style="margin-bottom:1rem;">
+                <div class="eyebrow">CURRENT UPLOADED BEARING</div>
+                <div style="font-size:1.08rem; font-weight:700; color:var(--text); margin-bottom:0.5rem;">
+                    {_active_name}
+                </div>
+                <div class="kpi-help">
+                    Latest diagnosis generated from the uploaded vibration CSV.
+                    Navigate between modules without re-uploading the file.
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        h1, h2, h3 = st.columns(3)
+        h1.metric("Predicted RUL", f"{rul:.1f}%")
+        h2.metric("90% Prediction Range", f"{lower:.1f}% – {upper:.1f}%")
+        h3.metric("Automatic Risk", risk)
+
+        st.markdown(
+            f"""
+            <div class="action-card" style="--zone-color:{act_col}; margin-top:0.8rem;">
+                <div class="eyebrow">PRESCRIBED ACTION</div>
+                <div style="font-family:'Space Grotesk'; font-size:1.25rem; color:{act_col}; font-weight:700;">
                     {action.upper()}
                 </div>
             </div>
-            """, unsafe_allow_html=True
+            """,
+            unsafe_allow_html=True,
         )
 
-    with st.expander("View Gauge & Details", icon=":material/speed:"):
-        fig_g, _, _ = rul_gauge(rul, lower, upper)
-        apply_plotly_readability(fig_g)
-        st.plotly_chart(fig_g, width="stretch")
+        with st.expander("Browse Project Evaluation Bearings", expanded=False):
+            if pred_df is None or pred_df.empty:
+                st.info("Project evaluation predictions are not available.")
+            else:
+                st.caption(
+                    "Optional: inspect the original project prediction outputs. "
+                    "The uploaded bearing above remains the active diagnostic."
+                )
+                b_col1, b_col2 = st.columns([1, 2])
+                with b_col1:
+                    bearing = st.selectbox(
+                        "Select Project Bearing:",
+                        sorted(pred_df["bearing"].unique()),
+                        key="project_health_bearing",
+                    )
+                bearing_df = pred_df[pred_df["bearing"] == bearing].reset_index(drop=True)
+                with b_col2:
+                    idx_col = "snapshot_idx" if "snapshot_idx" in bearing_df.columns else bearing_df.index
+                    snapshot = st.select_slider(
+                        "Select Inspection Snapshot:",
+                        options=sorted(bearing_df[idx_col].unique()),
+                        key="project_health_snapshot",
+                    )
+                row = bearing_df[bearing_df[idx_col] == snapshot].iloc[0]
+                st.dataframe(
+                    pd.DataFrame([{
+                        "Bearing": bearing,
+                        "Snapshot": snapshot,
+                        "Predicted RUL (%)": float(row["predicted_RUL_pct"]),
+                        "Lower Bound (%)": float(row["lower_bound_pct"]),
+                        "Upper Bound (%)": float(row["upper_bound_pct"]),
+                        "Risk": uncertainty_risk_level(
+                            float(row["predicted_RUL_pct"]),
+                            float(row["lower_bound_pct"]),
+                        )[0],
+                    }]),
+                    width="stretch",
+                    hide_index=True,
+                )
 
-    # Dark theme: particle-field trend of this bearing across its snapshots.
-    if DARK_MODE and "snapshot_idx" in bearing_df.columns and len(bearing_df) > 1:
-        st.markdown("### RUL Trend Across Snapshots")
-        _trend = bearing_df.sort_values("snapshot_idx")
-        render_particle_trend(
-            pd.DataFrame({
-                "Window": _trend["snapshot_idx"].values,
-                "Predicted RUL (%)": _trend["predicted_RUL_pct"].values,
-                "Lower Bound (%)": _trend["lower_bound_pct"].values,
-                "Upper Bound (%)": _trend["upper_bound_pct"].values,
-            })
+    elif pred_df is not None and not pred_df.empty:
+        st.info(
+            "No uploaded bearing is active in this session. "
+            "Showing the project evaluation predictions."
         )
+        b_col1, b_col2 = st.columns([1, 2])
+        with b_col1:
+            bearing = st.selectbox(
+                "Select Project Bearing:",
+                sorted(pred_df["bearing"].unique()),
+                key="project_health_bearing",
+            )
+        bearing_df = pred_df[pred_df["bearing"] == bearing].reset_index(drop=True)
+        with b_col2:
+            idx_col = "snapshot_idx" if "snapshot_idx" in bearing_df.columns else bearing_df.index
+            snapshot = st.select_slider(
+                "Select Inspection Snapshot:",
+                options=sorted(bearing_df[idx_col].unique()),
+                key="project_health_snapshot",
+            )
+        row = bearing_df[bearing_df[idx_col] == snapshot].iloc[0]
+        rul = float(row["predicted_RUL_pct"])
+        lower = float(row["lower_bound_pct"])
+        upper = float(row["upper_bound_pct"])
+        action = row.get(get_action_col(bearing_df), "Continue monitoring")
+        act_col = action_color(action)
+        risk, color, _ = uncertainty_risk_level(rul, lower)
+    else:
+        st.warning("No bearing prediction data available. Upload and analyze a CSV first.")
+        st.stop()
 
-
-# ============================================================
-# PAGE: MODEL PERFORMANCE
-# ============================================================
-elif page == "Model Performance":
-    st.markdown('<div class="eyebrow">MODULE // BENCHMARKING</div>', unsafe_allow_html=True)
-    st.markdown("## Model Performance Comparison")
-    st.caption("Comparison of candidate regression models evaluated on the unseen FEMTO-ST test bearings.")
-
-    model_df, model_live = load_model_comparison()
-    data_badge(model_live, "model performance")
-    st.dataframe(model_df, width="stretch", hide_index=True)
-
-    c1, c2 = st.columns(2)
-    with c1:
-        fig_mae = px.bar(
-            model_df,
-            x="model",
-            y="MAE",
-            title="Mean Absolute Error (Lower is Better)",
-            color="model",
+    # Common health display for the fallback project-bearing path.
+    if not _active:
+        st.markdown(
+            f"""
+            <div class="panel" style="border-top:3px solid {color}; margin-top:1rem;">
+                <div class="eyebrow">BEARING HEALTH STATUS</div>
+                <div style="font-size:2rem; font-weight:700; color:{color};">{risk.upper()} RISK</div>
+                <div class="kpi-help">Predicted Remaining Useful Life</div>
+                <div style="font-size:3rem; font-weight:700; color:{color};">{rul:.1f}%</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
         )
-        fig_mae.update_layout(
-            showlegend=False,
-            paper_bgcolor="rgba(0,0,0,0)",
-            plot_bgcolor="rgba(0,0,0,0)",
-            font={"color": COLOR["text"]},
-        )
-        apply_plotly_readability(fig_mae)
-        st.plotly_chart(fig_mae, width="stretch")
-    with c2:
-        fig_r2 = px.bar(
-            model_df,
-            x="model",
-            y="R2",
-            title="R² Score (Higher is Better)",
-            color="model",
-        )
-        fig_r2.update_layout(
-            showlegend=False,
-            paper_bgcolor="rgba(0,0,0,0)",
-            plot_bgcolor="rgba(0,0,0,0)",
-            font={"color": COLOR["text"]},
-        )
-        apply_plotly_readability(fig_r2)
-        st.plotly_chart(fig_r2, width="stretch")
+        c1, c2 = st.columns(2)
+        with c1:
+            st.metric("90% Prediction Range (CQR)", f"{lower:.1f}% – {upper:.1f}%")
+        with c2:
+            st.markdown(
+                f"""<div class="action-card" style="--zone-color:{act_col};">
+                    <div class="eyebrow">PRESCRIBED ACTION</div>
+                    <div style="font-family:'Space Grotesk'; font-size:1.25rem; color:{act_col}; font-weight:700;">{action.upper()}</div>
+                </div>""",
+                unsafe_allow_html=True,
+            )
 
 # ============================================================
 # PAGE: MAINTENANCE RECOMMENDATIONS
 # ============================================================
 elif page == "Maintenance Recommendations":
-    st.markdown('<div class="eyebrow">MODULE // DECISION LAYER</div>', unsafe_allow_html=True)
-    st.markdown("## Maintenance Policy & Actions")
+    st.markdown('<div class="eyebrow">MODULE // RISK-AWARE MAINTENANCE POLICY</div>', unsafe_allow_html=True)
+    st.markdown("## Maintenance Recommendations")
+    st.caption("Recommendations combine predicted remaining life with the lower bound of the calibrated prediction interval.")
 
+    _active = st.session_state.get("bearing_upload_result")
     pred_df, pred_live = load_predictions()
-    if pred_df is not None:
+
+    if _active:
+        _name = _active.get("filename", st.session_state.get("bearing_upload_name", "Uploaded bearing"))
+        _rul = float(_active.get("predicted_rul", 0.0))
+        _lower = float(_active.get("lower_bound", 0.0))
+        _upper = float(_active.get("upper_bound", 0.0))
+        _risk = _active.get("risk", "Unknown")
+        _action = _active.get("action", "Not available")
+        _act_color = action_color(_action)
+
+        st.markdown(
+            f'''<div class="panel panel-accent" style="border-top:4px solid {_act_color};">
+                <div class="eyebrow">CURRENT UPLOADED BEARING</div>
+                <div style="font-size:1.15rem;font-weight:700;margin-bottom:0.8rem;">{_name}</div>
+                <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:0.8rem;">
+                    <div><div class="eyebrow">PREDICTED RUL</div><div style="font-size:1.7rem;font-weight:700;">{_rul:.1f}%</div></div>
+                    <div><div class="eyebrow">90% LOWER BOUND</div><div style="font-size:1.7rem;font-weight:700;">{_lower:.1f}%</div></div>
+                    <div><div class="eyebrow">RISK</div><div style="font-size:1.7rem;font-weight:700;color:{_act_color};">{_risk.upper()}</div></div>
+                    <div><div class="eyebrow">ACTION</div><div style="font-size:1.05rem;font-weight:700;color:{_act_color};">{_action.upper()}</div></div>
+                </div>
+                <div class="kpi-help" style="margin-top:0.8rem;">90% prediction range: <b>{_lower:.1f}% – {_upper:.1f}%</b></div>
+            </div>''',
+            unsafe_allow_html=True,
+        )
+
+        st.info(
+            "This recommendation is generated automatically from the uploaded vibration data. "
+            "The displayed risk remains Low, Medium, or High; the action policy can distinguish inspection, scheduled maintenance, and immediate replacement."
+        )
+
+    if pred_df is not None and not pred_df.empty:
         action_col = get_action_col(pred_df)
         counts = pred_df[action_col].value_counts()
 
-        n_cont = int(counts.get("Continue monitoring", 0))
-        n_insp = int(counts.get("Inspect before replacement", 0))
-        n_sched = int(counts.get("Schedule maintenance", 0))
-        n_repl = int(counts.get("Replace immediately", 0))
+        st.markdown("### Project Evaluation Recommendations")
+        st.caption("These counts summarize the stored project prediction results and are separate from the currently uploaded bearing above.")
 
-        if DARK_MODE:
-            total_actions = max(n_cont + n_insp + n_sched + n_repl, 1)
-            render_metric_rings(
-                [
-                    {"label": "Continue Monitoring", "value": f"{n_cont}", "frac": n_cont / total_actions, "color": COLOR["healthy"], "sub": "windows"},
-                    {"label": "Inspect Before Replacement", "value": f"{n_insp}", "frac": n_insp / total_actions, "color": COLOR["caution"], "sub": "windows"},
-                    {"label": "Schedule Maintenance", "value": f"{n_sched}", "frac": n_sched / total_actions, "color": COLOR["warning"], "sub": "windows"},
-                    {"label": "Replace Immediately", "value": f"{n_repl}", "frac": n_repl / total_actions, "color": COLOR["critical"], "sub": "windows"},
-                ],
-                height=215,
-            )
-        else:
-            c1, c2, c3, c4 = st.columns(4)
-            c1.metric("Continue Monitoring", n_cont)
-            c2.metric("Inspect Before Replacement", n_insp)
-            c3.metric("Schedule Maintenance", n_sched)
-            c4.metric("Replace Immediately", n_repl)
+        zone_meta = {
+            "Continue monitoring": (COLOR["healthy"], "LOW", "Continue Monitoring", "Sufficient RUL remains."),
+            "Schedule maintenance": (COLOR["caution"], "HIGH", "Schedule Maintenance", "Plan maintenance in the near term."),
+            "Inspect before replacement": (COLOR["caution"], "MEDIUM", "Inspect Before Replacement", "The lower bound indicates downside risk."),
+            "Replace immediately": (COLOR["critical"], "HIGH", "Replace Immediately", "Point estimate and lower bound indicate severe risk."),
+        }
 
-        fig_pie = px.pie(
+        cols = st.columns(4)
+        for col, action in zip(cols, zone_meta):
+            color, tag, title, desc = zone_meta[action]
+            n = int(counts.get(action, 0))
+            with col:
+                st.markdown(
+                    f'''<div class="category-card" style="border-top:3px solid {color};">
+                        <div class="eyebrow" style="color:{color};">{tag}</div>
+                        <div style="font-family:'Space Grotesk';font-weight:700;font-size:1.02rem;">{title}</div>
+                        <div class="count" style="color:{color};">{n}</div>
+                        <div style="font-size:0.82rem;color:var(--text-dim);">{desc}</div>
+                    </div>''',
+                    unsafe_allow_html=True,
+                )
+
+        fig = px.pie(
             values=counts.values,
             names=counts.index,
             hole=0.55,
-            title="Recommended Action Distribution",
             color=counts.index,
             color_discrete_map={
                 "Continue monitoring": COLOR["healthy"],
-                "Inspect before replacement": COLOR["caution"],
-                "Schedule maintenance": COLOR["warning"],
+                "Schedule maintenance": COLOR["caution"],
+                "Inspect before replacement": COLOR["warning"],
                 "Replace immediately": COLOR["critical"],
             },
         )
-        fig_pie.update_layout(
+        fig.update_layout(
             paper_bgcolor="rgba(0,0,0,0)",
+            plot_bgcolor="rgba(0,0,0,0)",
             font={"color": COLOR["text"]},
+            legend={"orientation": "h", "y": -0.1},
+            title="Distribution of Recommended Actions",
         )
-        apply_plotly_readability(fig_pie)
-        st.plotly_chart(fig_pie, width="stretch")
-    else:
-        st.warning("No prediction data available.")
+        apply_plotly_readability(fig)
+        st.plotly_chart(fig, width="stretch")
+
+        with st.expander("Why these recommendations?", expanded=True):
+            st.markdown(
+                "The policy considers both the predicted RUL and the uncertainty around it. "
+                "A prediction with a low lower bound can trigger inspection or maintenance even when its point estimate appears relatively healthy."
+            )
+
+        with st.expander("View Technical Details"):
+            st.dataframe(pred_df, width="stretch", hide_index=True)
+    elif not _active:
+        st.warning("No recommendation data is available. Upload and analyze a bearing first.")
+
 
 # ============================================================
 # PAGE: PREDICTION CONFIDENCE
@@ -2951,8 +3212,53 @@ elif page == "AI Maintenance Assistant":
     pred_df, _ = load_predictions()
     imp_df, _ = load_feature_importance()
 
-    if pred_df is not None:
-        sel_bearing = st.selectbox("Select Asset for Explanation:", sorted(pred_df["bearing"].unique()))
+    # Prefer the currently uploaded bearing when one has been analyzed in
+    # this Streamlit session. This keeps the AI page tied to the same
+    # diagnosis shown on Upload Bearing Data and Dashboard.
+    _upload_result = st.session_state.get("bearing_upload_result")
+    _upload_name = st.session_state.get("bearing_upload_name")
+
+    if _upload_result:
+        _display_name = _upload_result.get("filename", _upload_name or "Uploaded bearing")
+        st.markdown(
+            f'''<div class="panel panel-accent">
+                <div class="eyebrow">CURRENT UPLOADED BEARING</div>
+                <div style="font-size:1.05rem; font-weight:700; margin-bottom:0.45rem;">
+                    {_display_name}
+                </div>
+                <div class="kpi-help">
+                    RUL: <b>{float(_upload_result.get("predicted_rul", 0)):.1f}%</b> &nbsp; | &nbsp;
+                    Risk: <b>{_upload_result.get("risk", "Unknown")}</b> &nbsp; | &nbsp;
+                    Action: <b>{_upload_result.get("action", "Not available")}</b>
+                </div>
+            </div>''',
+            unsafe_allow_html=True,
+        )
+
+        if st.button("Generate AI Explanation for Uploaded Bearing", use_container_width=True):
+            try:
+                with st.spinner("Generating grounded explanation for the uploaded bearing..."):
+                    _upload_ai_row = {
+                        "bearing": _display_name,
+                        "snapshot_idx": 0,
+                        "predicted_RUL_pct": float(_upload_result.get("predicted_rul", 0)),
+                        "lower_bound_pct": float(_upload_result.get("lower_bound", 0)),
+                        "upper_bound_pct": float(_upload_result.get("upper_bound", 0)),
+                        "recommended_action": _upload_result.get("action", "Not available"),
+                    }
+                    expl = generate_ollama_explanation(_upload_ai_row, imp_df)
+                    st.session_state["fleet_ai_text"] = expl
+                    st.session_state["fleet_ai_file"] = _display_name
+            except Exception as e:
+                st.error(f"Ollama execution failed: {e}")
+
+    elif pred_df is not None and not pred_df.empty:
+        st.info("No uploaded bearing is active in this session. You can still explain an existing project bearing below.")
+        sel_bearing = st.selectbox(
+            "Select Project Bearing for Explanation:",
+            sorted(pred_df["bearing"].unique()),
+            key="fleet_asset_selector",
+        )
         b_slice = pred_df[pred_df["bearing"] == sel_bearing].iloc[0]
 
         if st.button("Generate Plant Engineer Summary", use_container_width=True):
@@ -2960,15 +3266,18 @@ elif page == "AI Maintenance Assistant":
                 with st.spinner("Generating grounded explanation..."):
                     expl = generate_ollama_explanation(b_slice, imp_df)
                     st.session_state["fleet_ai_text"] = expl
+                    st.session_state["fleet_ai_file"] = sel_bearing
             except Exception as e:
                 st.error(f"Ollama execution failed: {e}")
+    else:
+        st.info("Upload and analyze a bearing first to use the grounded AI assistant.")
 
-        if "fleet_ai_text" in st.session_state:
-            with st.expander(
-                "AI Maintenance Explanation",
-                expanded=True,
-                icon=":material/smart_toy:",
-            ):
-                st.markdown(st.session_state["fleet_ai_text"])
+    if "fleet_ai_text" in st.session_state:
+        with st.expander(
+            "AI Maintenance Explanation",
+            expanded=True,
+            icon=":material/smart_toy:",
+        ):
+            st.markdown(st.session_state["fleet_ai_text"])
 
 # FINAL PRESENTATION BUILD: synthetic low-risk generator removed; live risk is data-driven.

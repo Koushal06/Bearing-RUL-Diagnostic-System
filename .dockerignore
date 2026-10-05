@@ -1,0 +1,19 @@
+﻿.git
+.gitignore
+__pycache__
+*.pyc
+
+.env
+
+data
+outputs
+src
+
+*.ipynb
+*.xlsx
+*.zip
+
+RMS_vibration_MA_project.png
+Section C -Certainity.png
+
+src/catboost_info

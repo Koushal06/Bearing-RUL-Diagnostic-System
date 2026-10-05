@@ -1,0 +1,21 @@
+{
+  "project": "Bearing RUL Prediction",
+  "point_model": "CatBoost",
+  "uncertainty_method": "CQR",
+  "point_model_file": "best_model.pkl",
+  "lower_quantile_model_file": "q_lo_model.pkl",
+  "upper_quantile_model_file": "q_hi_model.pkl",
+  "feature_file": "selected_feature_names.json",
+  "conformal_config_file": "conformal_config.json",
+  "sampling_rate_hz": 25600,
+  "window_samples": 2560,
+  "window_duration_seconds": 0.1,
+  "channels": [
+    "horizontal",
+    "vertical"
+  ],
+  "maintenance_thresholds": {
+    "critical_rul_percent": 20,
+    "healthy_rul_percent": 40
+  }
+}

@@ -1,0 +1,8 @@
+{
+  "method": "Conformalized Quantile Regression",
+  "coverage_target": 0.9,
+  "alpha": 0.1,
+  "lower_quantile": 0.05,
+  "upper_quantile": 0.95,
+  "q_hat": 1.446941218329871
+}

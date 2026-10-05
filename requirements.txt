@@ -11,3 +11,4 @@ joblib
 google-generativeai
 plotly
 ollama
+PyWavelets
